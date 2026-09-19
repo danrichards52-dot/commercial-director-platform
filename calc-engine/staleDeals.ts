@@ -3,18 +3,22 @@ import {
   computeHistoricalStageObservations,
   StageHistoricalObservation,
 } from "./historicalObservations";
-import { resolveStaleOpportunityThresholdDays } from "./benchmarks";
+import { resolveStaleOpportunityThresholdDays, ResolvedBenchmark } from "./benchmarks";
 
 export interface StaleDealFlag {
   deal: Deal;
   daysInCurrentStage: number;
   /**
-   * Which figure actually decided staleness for this deal. REQ-006 compares against the
-   * stage's historical average when one exists; RULE-010's organisation threshold is the
-   * fallback for a stage with no closed-deal history yet.
+   * RULE-012: the organisation's configured stale-opportunity threshold (RULE-010) is the
+   * *only* comparator for whether a deal is flagged — full stop, no exceptions. A per-stage
+   * historical average, however confident, never overrides it; that would let a business's
+   * own bad historical performance silently redefine what "stale" means for it (the same
+   * drift RULE-001/009 forbid elsewhere).
    */
-  comparator: { type: "historical_average" | "stale_threshold_benchmark"; days: number };
-  /** RULE-009: always surfaced alongside, even when the benchmark (not history) decided staleness. */
+  threshold: ResolvedBenchmark<number>;
+  /** Positive once the deal has exceeded the threshold; negative/zero otherwise. */
+  daysBeyondThreshold: number;
+  /** RULE-009: always shown alongside, purely as confidence-graded context — never a factor in `isStale`. */
   historicalObservation: StageHistoricalObservation | null;
   isStale: boolean;
 }
@@ -24,6 +28,7 @@ function daysBetween(startIso: string, endIso: string): number {
   return Math.round((new Date(endIso).getTime() - new Date(startIso).getTime()) / msPerDay);
 }
 
+/** REQ-006 / RULE-012. */
 export function flagStaleDeals(
   deals: Deal[],
   baseline: CommercialBaseline,
@@ -31,23 +36,20 @@ export function flagStaleDeals(
 ): StaleDealFlag[] {
   const openDeals = deals.filter((d) => d.status === "open");
   const historicalByStage = computeHistoricalStageObservations(deals);
-  const resolvedThreshold = resolveStaleOpportunityThresholdDays(baseline);
+  const threshold = resolveStaleOpportunityThresholdDays(baseline);
 
   return openDeals.map((deal) => {
     const daysInCurrentStage = daysBetween(deal.stageEntryDate, now);
     const historicalObservation = historicalByStage.get(deal.stage) ?? null;
-
-    const comparator =
-      historicalObservation !== null
-        ? ({ type: "historical_average", days: historicalObservation.averageDwellDays } as const)
-        : ({ type: "stale_threshold_benchmark", days: resolvedThreshold.value } as const);
+    const daysBeyondThreshold = daysInCurrentStage - threshold.value;
 
     return {
       deal,
       daysInCurrentStage,
-      comparator,
+      threshold,
+      daysBeyondThreshold,
       historicalObservation,
-      isStale: daysInCurrentStage > comparator.days,
+      isStale: daysInCurrentStage > threshold.value,
     };
   });
 }

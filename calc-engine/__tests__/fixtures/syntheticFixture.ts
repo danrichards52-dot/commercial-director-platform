@@ -49,47 +49,63 @@ function closedDealsForStage(
 }
 
 // --- RULE-009 confidence bands ---
-// "Discovery": 0 closed deals -> "none"
-// "Proposal": 2 closed deals, 18-day average dwell -> "early_indication" (1-4)
+// "Proposal": 25 closed deals, 52-day average dwell -> "established_baseline" (20+) — AC-006-01's exact numbers.
+// "Discovery": 2 closed deals, 15-day average dwell -> "early_indication" (1-4) — AC-006-03's second stage.
 // "Negotiation": 10 closed deals, 25-day average dwell -> "developing_baseline" (5-19)
 // "Qualified": 22 closed deals, 12-day average dwell -> "established_baseline" (20+)
 // Marked "lost" rather than "won" deliberately — these exist only to seed RULE-009's
 // per-stage dwell-time history and must not also inflate RULE-004's order-book total.
 const closedDeals: Deal[] = [
-  ...closedDealsForStage("Proposal", 2, 18, "lost"),
+  ...closedDealsForStage("Proposal", 25, 52, "lost"),
+  ...closedDealsForStage("Discovery", 2, 15, "lost"),
   ...closedDealsForStage("Negotiation", 10, 25, "lost"),
   ...closedDealsForStage("Qualified", 22, 12, "lost"),
 ];
 
-// --- REQ-006 stale-deal flagging, via the historical-average comparator ---
-// Sits in "Proposal" (historical average 18 days, from above) for 52 days -> stale.
-// Matches AC-006-01's own example numbers exactly.
-const staleDealViaHistory: Deal = {
-  id: nextId("stale-history"),
-  name: "Stale proposal deal (historical comparator)",
+// --- AC-006-01: flagged despite a slower historical average ---
+// Org threshold = 30 days (baseline below). This deal has sat 43 days in "Proposal," whose
+// historical average (25 closed deals, established baseline, from above) is 52 days — slower
+// than the deal's own dwell time. It MUST still be flagged: 43 > 30. The historical average is
+// context, never a reason to withhold the flag (RULE-012, correcting the rejected RULE-012 draft
+// that let confidence-gated history override the threshold).
+const staleDealEstablishedHistory: Deal = {
+  id: nextId("stale-established-history"),
+  name: "Proposal deal, stale despite a slower stage average",
   value: 12000,
   stage: "Proposal",
-  stageEntryDate: addDaysIso(iso(1, 1), -52),
+  stageEntryDate: addDaysIso(iso(1, 1), -43),
   expectedCloseDate: iso(6, 1),
   status: "open",
-  qualificationTier: "likely",
+  qualificationTier: "too_early",
   closeDate: null,
 };
 
-// --- REQ-006 stale-deal flagging, via the RULE-010 benchmark fallback comparator ---
-// "Discovery" has zero closed deals (no historical average exists), so staleness falls back
-// to the resolved stale-opportunity threshold: baseline below has no explicit threshold set
-// and a 40-day sales-cycle benchmark, so RULE-010 derives 20 days (50% of 40, rounded).
-// 25 days in stage > 20-day threshold -> stale.
-const staleDealViaThreshold: Deal = {
-  id: nextId("stale-threshold"),
-  name: "Stale discovery deal (threshold comparator, no stage history)",
+// --- AC-006-03: a second stage, low-confidence history, same threshold decides it ---
+// "Discovery" has only 2 closed deals (early_indication, not established_baseline) — proving
+// the confidence label never changes which deals get flagged, only how the context reads.
+// 35 days in stage > 30-day threshold -> stale.
+const staleDealEarlyIndicationHistory: Deal = {
+  id: nextId("stale-early-indication-history"),
+  name: "Discovery deal, stale with only early-indication history",
   value: 8000,
   stage: "Discovery",
-  stageEntryDate: addDaysIso(iso(1, 1), -25),
+  stageEntryDate: addDaysIso(iso(1, 1), -35),
   expectedCloseDate: iso(7, 1),
   status: "open",
-  qualificationTier: "too_early",
+  qualificationTier: "unlikely",
+  closeDate: null,
+};
+
+// A deal well inside the threshold, to prove the negative case isn't flagged.
+const notStaleDeal: Deal = {
+  id: nextId("not-stale"),
+  name: "Negotiation deal, well within threshold",
+  value: 6000,
+  stage: "Negotiation",
+  stageEntryDate: addDaysIso(iso(1, 1), -10),
+  expectedCloseDate: iso(4, 1),
+  status: "open",
+  qualificationTier: "unlikely",
   closeDate: null,
 };
 
@@ -171,8 +187,9 @@ const wonMatchedDeal: Deal = {
 
 export const syntheticDeals: Deal[] = [
   ...closedDeals,
-  staleDealViaHistory,
-  staleDealViaThreshold,
+  staleDealEstablishedHistory,
+  staleDealEarlyIndicationHistory,
+  notStaleDeal,
   tooEarlyDeal,
   unlikelyDeal,
   likelyDeal,
@@ -189,8 +206,8 @@ export const syntheticPnlLines: PnlLine[] = [
 
 export const syntheticBaseline: CommercialBaseline = {
   salesCycleDays: 40,
-  // Unset -> exercises RULE-010's "derived from sales-cycle" path (20 days).
-  staleOpportunityThresholdDays: null,
+  // Explicit — RULE-012's flagging comparator, per AC-006-01/AC-006-03.
+  staleOpportunityThresholdDays: 30,
   revenueTargetAnnual: 300000,
   marginTargetPercent: 25,
   minimumAcceptableMarginPercent: 15,
@@ -218,8 +235,9 @@ export function buildInput(overrides: Partial<CalcEngineInput> = {}): CalcEngine
 }
 
 export const fixtureIds = {
-  staleDealViaHistory: staleDealViaHistory.id,
-  staleDealViaThreshold: staleDealViaThreshold.id,
+  staleDealEstablishedHistory: staleDealEstablishedHistory.id,
+  staleDealEarlyIndicationHistory: staleDealEarlyIndicationHistory.id,
+  notStaleDeal: notStaleDeal.id,
   tooEarlyDeal: tooEarlyDeal.id,
   unlikelyDeal: unlikelyDeal.id,
   likelyDeal: likelyDeal.id,

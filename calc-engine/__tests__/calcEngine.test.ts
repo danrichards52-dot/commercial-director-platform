@@ -7,45 +7,84 @@ import {
 } from "./fixtures/syntheticFixture";
 
 describe("RULE-009 historical confidence bands", () => {
-  it("assigns none/early/developing/established by qualifying closed-deal count", () => {
+  it("assigns early/developing/established by qualifying closed-deal count", () => {
     const result = computeCalcEngineResult(buildInput());
     const byId = new Map(result.staleDeals.map((f) => [f.deal.id, f]));
 
-    const viaHistory = byId.get(fixtureIds.staleDealViaHistory)!;
-    expect(viaHistory.historicalObservation?.confidence).toBe("early_indication");
-    expect(viaHistory.historicalObservation?.averageDwellDays).toBe(18);
-    expect(viaHistory.historicalObservation?.qualifyingRecordCount).toBe(2);
+    const establishedHistory = byId.get(fixtureIds.staleDealEstablishedHistory)!;
+    expect(establishedHistory.historicalObservation?.confidence).toBe("established_baseline");
+    expect(establishedHistory.historicalObservation?.averageDwellDays).toBe(52);
+    expect(establishedHistory.historicalObservation?.qualifyingRecordCount).toBe(25);
 
-    const viaThreshold = byId.get(fixtureIds.staleDealViaThreshold)!;
-    expect(viaThreshold.historicalObservation).toBeNull();
+    const earlyIndicationHistory = byId.get(fixtureIds.staleDealEarlyIndicationHistory)!;
+    expect(earlyIndicationHistory.historicalObservation?.confidence).toBe("early_indication");
+    expect(earlyIndicationHistory.historicalObservation?.averageDwellDays).toBe(15);
+    expect(earlyIndicationHistory.historicalObservation?.qualifyingRecordCount).toBe(2);
   });
 });
 
-describe("REQ-006 stale-deal flagging", () => {
-  it("flags a deal against its stage's historical average when one exists", () => {
+describe("RULE-012 stale-deal flagging always uses the organisation's threshold", () => {
+  it("AC-006-01: flags a deal despite a slower historical average, and never uses it as the comparator", () => {
     const result = computeCalcEngineResult(buildInput());
-    const flag = result.staleDeals.find((f) => f.deal.id === fixtureIds.staleDealViaHistory)!;
+    const flag = result.staleDeals.find(
+      (f) => f.deal.id === fixtureIds.staleDealEstablishedHistory
+    )!;
 
-    expect(flag.comparator.type).toBe("historical_average");
-    expect(flag.comparator.days).toBe(18);
-    expect(flag.daysInCurrentStage).toBe(52);
+    // Org threshold is 30 days; the deal has sat 43 days — that alone decides the flag.
+    expect(flag.threshold.value).toBe(30);
+    expect(flag.daysInCurrentStage).toBe(43);
+    expect(flag.daysBeyondThreshold).toBe(13);
     expect(flag.isStale).toBe(true);
+
+    // The 52-day historical average (slower than the deal's own 43 days) is shown as
+    // context only — it must never be what the flag was checked against.
+    expect(flag.historicalObservation?.averageDwellDays).toBe(52);
   });
 
-  it("falls back to the RULE-010 benchmark threshold when no stage history exists", () => {
+  it("AC-006-03: a second stage with only early-indication history flags on the same threshold", () => {
     const result = computeCalcEngineResult(buildInput());
-    const flag = result.staleDeals.find((f) => f.deal.id === fixtureIds.staleDealViaThreshold)!;
+    const flag = result.staleDeals.find(
+      (f) => f.deal.id === fixtureIds.staleDealEarlyIndicationHistory
+    )!;
 
-    expect(flag.comparator.type).toBe("stale_threshold_benchmark");
-    expect(flag.comparator.days).toBe(20); // 50% of the 40-day sales-cycle benchmark
-    expect(flag.daysInCurrentStage).toBe(25);
+    expect(flag.threshold.value).toBe(30);
+    expect(flag.daysInCurrentStage).toBe(35);
     expect(flag.isStale).toBe(true);
+    // Confidence differs from AC-006-01's deal, but that never changes whether it's flagged.
+    expect(flag.historicalObservation?.confidence).toBe("early_indication");
+  });
+
+  it("does not flag a deal that hasn't exceeded the threshold", () => {
+    const result = computeCalcEngineResult(buildInput());
+    const flag = result.staleDeals.find((f) => f.deal.id === fixtureIds.notStaleDeal)!;
+
+    expect(flag.daysInCurrentStage).toBe(10);
+    expect(flag.threshold.value).toBe(30);
+    expect(flag.isStale).toBe(false);
   });
 });
 
 describe("RULE-010 stale-opportunity threshold fallback chain", () => {
-  it("derives 50% of the sales-cycle benchmark when no explicit threshold is set", () => {
+  it("uses the explicitly configured threshold over any derived value", () => {
     const result = computeCalcEngineResult(buildInput());
+    expect(result.resolvedBenchmarks.staleOpportunityThresholdDays).toEqual({
+      value: 30,
+      source: "configured",
+    });
+  });
+
+  it("derives 50% of the sales-cycle benchmark when no explicit threshold is set", () => {
+    const result = computeCalcEngineResult(
+      buildInput({
+        baseline: {
+          salesCycleDays: 40,
+          staleOpportunityThresholdDays: null,
+          revenueTargetAnnual: 300000,
+          marginTargetPercent: null,
+          minimumAcceptableMarginPercent: null,
+        },
+      })
+    );
     expect(result.resolvedBenchmarks.staleOpportunityThresholdDays).toEqual({
       value: 20,
       source: "derived",
@@ -74,9 +113,8 @@ describe("RULE-010 stale-opportunity threshold fallback chain", () => {
 describe("RULE-003 qualification tiers", () => {
   it("only Likely/Highly likely deals contribute to the trajectory, at full value", () => {
     const result = computeCalcEngineResult(buildInput());
-    // staleDealViaHistory (12,000, likely) + likelyDeal (15,000) + highlyLikelyDeal (25,000) = 52,000;
-    // too-early/unlikely contribute £0.
-    expect(result.verdict.qualifiedPipelineValue).toBe(52000);
+    // likelyDeal (15,000) + highlyLikelyDeal (25,000) = 40,000; too-early/unlikely contribute £0.
+    expect(result.verdict.qualifiedPipelineValue).toBe(40000);
   });
 });
 
@@ -85,10 +123,10 @@ describe("RULE-008 pipeline coverage", () => {
     const result = computeCalcEngineResult(buildInput());
     const coverage = result.verdict.coverage!;
 
-    // Raw = all open deals: 12000 + 8000 + 3000 + 4000 + 15000 + 25000 = 67000
-    expect(coverage.rawPipelineValue).toBe(67000);
-    // Qualified = likely + highly likely only: 12000 + 15000 + 25000 = 52000
-    expect(coverage.qualifiedPipelineValue).toBe(52000);
+    // Raw = all open deals: 12000 + 8000 + 6000 + 3000 + 4000 + 15000 + 25000 = 73000
+    expect(coverage.rawPipelineValue).toBe(73000);
+    // Qualified = likely + highly likely only: 15000 + 25000 = 40000
+    expect(coverage.qualifiedPipelineValue).toBe(40000);
     expect(coverage.rawPipelineValue).not.toBe(coverage.qualifiedPipelineValue);
   });
 });
@@ -153,9 +191,9 @@ describe("RULE-002 derived targets", () => {
 describe("REQ-003/004 verdict direction and gap", () => {
   it("computes gap as target minus (invoiced + order book + qualified pipeline)", () => {
     const result = computeCalcEngineResult(buildInput({ period: "year" }));
-    // invoiced 51000 + order book 18000 + qualified pipeline 52000 = 121000
-    expect(result.verdict.actualTotal).toBe(121000);
-    expect(result.verdict.gap).toBe(300000 - 121000);
+    // invoiced 51000 + order book 18000 + qualified pipeline 40000 = 109000
+    expect(result.verdict.actualTotal).toBe(109000);
+    expect(result.verdict.gap).toBe(300000 - 109000);
     expect(result.verdict.direction).toBe("behind");
   });
 });
