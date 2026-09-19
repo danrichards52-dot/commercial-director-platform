@@ -31,3 +31,6 @@ next-env.d.ts
 # supabase local dev
 /supabase/.branches
 /supabase/.temp
+
+# isolation test fixtures (contains disposable test-account credentials)
+tests/isolation/.fixtures.json
