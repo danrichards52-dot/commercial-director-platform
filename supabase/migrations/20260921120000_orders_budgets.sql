@@ -62,17 +62,30 @@ alter table pnl_lines add constraint pnl_lines_upload_id_business_fk
   foreign key (upload_id, business_id) references uploads (id, business_id)
   on delete cascade;
 
--- RULE-016 (corrected): invoiced_as_of is DERIVED from uploads' own declared cutoffs, never
--- stored or inferred from a write timestamp. The most recent complete-P&L position for a
--- business is the latest declares_replacement_through among its 'pnl' uploads.
+-- RULE-016 (corrected, twice): invoiced_as_of is DERIVED from uploads' own declared cutoffs,
+-- never stored or inferred from a write timestamp. It is NOT the maximum declared cutoff
+-- across all history — an old upload's wide-looking cutoff can be stale once a later, narrower
+-- correction has superseded part of its range (RULE-015: uploads replace only the periods they
+-- declare, so a correction with an EARLIER cutoff than a prior upload is a legitimate way to
+-- narrow the currently-accurate position, not a regression to ignore). The currently
+-- authoritative position is instead the declared cutoff of the MOST RECENTLY applied 'pnl'
+-- upload — "applied" meaning it actually produced pnl_lines rows, not merely that an uploads
+-- row exists (an upload record alone doesn't establish its data was successfully applied).
 create or replace function invoiced_as_of(p_business_id uuid) returns date
 language sql
 stable
 as $$
-  select max(declares_replacement_through)
-  from uploads
-  where business_id = p_business_id and kind = 'pnl';
+  select u.declares_replacement_through
+  from public.uploads u
+  where u.business_id = p_business_id
+    and u.kind = 'pnl'
+    and exists (select 1 from public.pnl_lines pl where pl.upload_id = u.id)
+  order by u.uploaded_at desc
+  limit 1;
 $$;
+
+revoke all on function invoiced_as_of(uuid) from public;
+grant execute on function invoiced_as_of(uuid) to authenticated;
 
 -- ---------------------------------------------------------------------------
 -- orders — REQ-016
@@ -108,6 +121,12 @@ alter table orders add constraint orders_id_business_id_unique unique (id, busin
 
 alter table orders enable row level security;
 revoke all on orders from anon, public;
+-- Explicit, not assumed: a disposable test branch was found to NOT replicate the live
+-- project's default table-level grants for `authenticated` (branches only had TRUNCATE/
+-- REFERENCES/TRIGGER, missing SELECT/INSERT/UPDATE/DELETE entirely). Rather than rely on
+-- platform default privileges holding in every environment this migration might run against,
+-- every new table in this migration grants exactly what its RLS policies allow, explicitly.
+grant select, insert, update, delete on orders to authenticated;
 
 create policy "orders_owner_all" on orders
   for all
@@ -140,6 +159,7 @@ alter table order_allocations add constraint order_allocations_order_id_business
 
 alter table order_allocations enable row level security;
 revoke all on order_allocations from anon, public;
+grant select, insert, update, delete on order_allocations to authenticated;
 
 create policy "order_allocations_owner_all" on order_allocations
   for all
@@ -200,6 +220,14 @@ create trigger orders_zero_out_on_complete
   before update on orders
   for each row execute function zero_out_order_on_complete();
 
+-- Concurrency fix: a plain (unlocked) read of orders.status here would let a concurrent
+-- INSERT/UPDATE race a concurrent "mark order complete" transaction — under READ COMMITTED,
+-- this trigger's SELECT can see the pre-completion 'open' status if the completing
+-- transaction hasn't committed yet, let a positive allocation through, and then never get
+-- zeroed (the completing transaction's own zero-out step already ran before this row
+-- existed). `for update` forces this read to take the same row lock the completing UPDATE
+-- holds, so this trigger blocks until that transaction commits or rolls back, then reads the
+-- fresh, post-commit status — closing the race rather than reasoning it away.
 create or replace function reject_allocation_write_on_completed_order() returns trigger
 language plpgsql
 as $$
@@ -207,7 +235,7 @@ declare
   v_order_status text;
 begin
   if new.outstanding_value > 0 then
-    select status into v_order_status from orders where id = new.order_id;
+    select status into v_order_status from public.orders where id = new.order_id for update;
     if v_order_status = 'complete' then
       raise exception 'order % is already complete — cannot write a positive outstanding_value (%) to its allocations', new.order_id, new.outstanding_value
         using errcode = 'check_violation';
@@ -246,6 +274,15 @@ alter table budget_sets add constraint budget_sets_id_business_id_unique unique 
 
 alter table budget_sets enable row level security;
 revoke all on budget_sets from anon, public;
+-- Table-level grant matches RLS exactly — select + insert only, no update/delete. This is
+-- deliberately NOT "grant everything and let RLS deny it" — granting only what's actually
+-- reachable means the grant itself documents the truth. The explicit REVOKE matters just as
+-- much as the GRANT here: a platform whose default privileges already hand `authenticated`
+-- ALL on new tables (true on the live project, confirmed when the first migration shipped)
+-- would otherwise still leave UPDATE/DELETE grantable regardless of what this migration
+-- grants — granting a narrower set doesn't retract a broader one already in effect.
+grant select, insert on budget_sets to authenticated;
+revoke update, delete on budget_sets from authenticated;
 
 -- Corrected: NO direct UPDATE or DELETE policy for authenticated at all. Without one, both
 -- are unconditionally denied by RLS — an owner cannot flip 'active' back to 'draft' to edit
@@ -271,6 +308,13 @@ create trigger budget_sets_set_updated_at
   before update on budget_sets
   for each row execute function set_updated_at();
 
+-- Defensive hardening for the SECURITY DEFINER function below: as of Postgres 15 the public
+-- schema no longer grants CREATE to PUBLIC by default, but this asserts it explicitly rather
+-- than assuming the platform default holds — an untrusted role able to create objects in a
+-- schema on this function's search path could shadow an unqualified reference and have its
+-- object executed with this function's elevated privilege.
+revoke create on schema public from public;
+
 -- Activates a draft budget_set, superseding whatever was previously active for the same
 -- business/year, as a single atomic operation.
 --
@@ -278,44 +322,57 @@ create trigger budget_sets_set_updated_at
 -- for authenticated at all now, so a SECURITY INVOKER function couldn't perform these writes
 -- regardless of caller. Running as the function owner (which owns budget_sets, so bypasses
 -- RLS the same way any table owner does) means this function is now the *only* path capable
--- of changing a budget_set's status — which is exactly the point: a controlled, validated
--- gate instead of an open UPDATE surface. Because RLS no longer applies automatically, the
--- function performs its own explicit ownership check before touching anything, and
--- `set search_path = public` is set explicitly (standard hardening for SECURITY DEFINER
--- functions, closing the search-path-injection class of attack).
+-- of changing a budget_set's status. Because RLS no longer applies automatically, the
+-- function performs its own explicit ownership check before touching anything.
+--
+-- Hardening, corrected: `set search_path = public` alone is NOT sufficient — Postgres's own
+-- SECURITY DEFINER documentation warns that even a trusted schema on the path can be shadowed
+-- by a temporary table an untrusted role creates (temp schemas are implicitly searched before
+-- the rest of the path). `search_path` is set to '' (empty) instead, and every object this
+-- function touches is fully schema-qualified (public.*, auth.uid()) so nothing depends on
+-- search_path resolution at all — an unqualified reference would simply fail to resolve
+-- rather than silently pick up an attacker-created shadow object.
 --
 -- Validation order: not found -> not owned (same error as not found, deliberately, so the
 -- caller can't distinguish "doesn't exist" from "exists but isn't yours") -> not draft ->
--- structural completeness -> supersede -> activate. Structural validation runs as the LAST
--- step before the final UPDATE, inside the same transaction, to keep the window where a
--- concurrent insert into budget_lines could race past validation as narrow as possible.
--- That race is not fully closed — locking the budget_sets row doesn't block writes to the
--- child tables — and is accepted as open for MVP given single-user-per-business; closing it
--- fully would need locking budget_lines/budget_line_months too, which isn't done here.
+-- structural completeness -> supersede -> activate.
 --
--- Concurrency: a concurrent transaction activating a DIFFERENT draft for the same
--- business/year does not silently "win" or get silently skipped — it fails outright on the
--- partial unique index (or, if it reaches its own supersede step first, this transaction's
--- own activating UPDATE fails instead). Either way the losing call must be caught and
--- retried by the caller (e.g. "someone already activated a different budget, refresh and
--- retry") — this function does not hide or paper over that failure.
+-- Concurrency, corrected: locking only the budget_sets row does NOT stop a concurrent write
+-- to budget_lines/budget_line_months from invalidating validation mid-flight — that was
+-- previously accepted as an open race for MVP; it is not acceptable and is now closed.
+-- budget_lines and budget_line_months each carry a BEFORE trigger (see their sections below)
+-- that locks this same budget_sets row (`for update`) before allowing ANY insert, update or
+-- delete against them. Since this function takes that same row lock as its very first
+-- statement and holds it for the whole transaction, every concurrent child-table write for
+-- this budget_set blocks until activation commits or rolls back — and once unblocked, is
+-- re-evaluated against the now-current status by the existing draft-only RLS policies, which
+-- correctly deny it if the set is no longer draft. This closes both the "delete a month
+-- mid-validation" and "insert a new incomplete line mid-validation" races structurally, not
+-- by convention. Verified with real overlapping transactions — see tests/migrations/.
+--
+-- A concurrent transaction activating a DIFFERENT draft for the same business/year does not
+-- silently "win" or get silently skipped — it fails outright on the partial unique index (or
+-- on its own activating UPDATE, if it reaches the supersede step first). Either way the
+-- losing call must be caught and retried by the caller (e.g. "someone already activated a
+-- different budget, refresh and retry") — this function does not hide or paper over that
+-- failure.
 create or replace function activate_budget_set(p_budget_set_id uuid)
-returns budget_sets
+returns public.budget_sets
 language plpgsql
 security definer
-set search_path = public
+set search_path = ''
 as $$
 declare
   v_business_id uuid;
   v_year integer;
   v_status text;
   v_owns boolean;
-  v_result budget_sets;
+  v_result public.budget_sets;
   v_incomplete_line_count integer;
 begin
   select business_id, year, status
     into v_business_id, v_year, v_status
-    from budget_sets
+    from public.budget_sets
     where id = p_budget_set_id
     for update;
 
@@ -324,7 +381,7 @@ begin
   end if;
 
   select exists (
-    select 1 from businesses where id = v_business_id and owner_user_id = auth.uid()
+    select 1 from public.businesses where id = v_business_id and owner_user_id = auth.uid()
   ) into v_owns;
 
   if not v_owns then
@@ -337,37 +394,46 @@ begin
   end if;
 
   -- Structural completeness (RULE-017/AC-017-06): this is "every row parses and every line
-  -- has an amount for every month" — the system's own job to verify. It is deliberately NOT
-  -- "every real customer the owner meant to include is present," which RULE-017 explicitly
-  -- reserves for the owner's own judgment via the reviewed preview, not something the system
-  -- can check.
-  if not exists (select 1 from budget_lines where budget_set_id = p_budget_set_id) then
+  -- has an amount for every month of the set's own year" — the system's own job to verify.
+  -- It is deliberately NOT "every real customer the owner meant to include is present," which
+  -- RULE-017 explicitly reserves for the owner's own judgment via the reviewed preview, not
+  -- something the system can check.
+  if not exists (select 1 from public.budget_lines where budget_set_id = p_budget_set_id) then
     raise exception 'budget_set % has no budget lines — an empty draft cannot be activated', p_budget_set_id
       using errcode = 'integrity_constraint_violation';
   end if;
 
+  -- Corrected: counts only months that actually fall within this budget_set's own year,
+  -- rather than trusting "12 rows exist" to imply "12 rows in the right year". This is now a
+  -- defense-in-depth check, not the only line of defense — budget_lines.budget_set_id is
+  -- immutable (see the reparent-rejection trigger below) and every budget_line_months row is
+  -- validated against its parent's year on write (check_budget_line_month_year), so a line
+  -- can no longer be populated under one year and silently moved under another. This check
+  -- verifies that invariant actually held, rather than assuming it.
   select count(*) into v_incomplete_line_count
   from (
     select bl.id
-    from budget_lines bl
-    left join budget_line_months blm on blm.budget_line_id = bl.id
+    from public.budget_lines bl
+    left join public.budget_line_months blm
+      on blm.budget_line_id = bl.id
+      and extract(year from blm.month)::integer = v_year
     where bl.budget_set_id = p_budget_set_id
     group by bl.id
-    having count(blm.id) < 12
+    having count(distinct extract(month from blm.month)) < 12
   ) incomplete;
 
   if v_incomplete_line_count > 0 then
-    raise exception 'budget_set % has % line(s) missing one or more months — every line must have all 12 months resolved before activation', p_budget_set_id, v_incomplete_line_count
+    raise exception 'budget_set % has % line(s) missing one or more months within its own year (%) — every line must have all 12 months resolved before activation', p_budget_set_id, v_incomplete_line_count, v_year
       using errcode = 'integrity_constraint_violation';
   end if;
 
-  update budget_sets
+  update public.budget_sets
     set status = 'superseded'
     where business_id = v_business_id
       and year = v_year
       and status = 'active';
 
-  update budget_sets
+  update public.budget_sets
     set status = 'active', confirmed_at = now()
     where id = p_budget_set_id
     returning * into v_result;
@@ -425,6 +491,7 @@ alter table budget_lines add constraint budget_lines_id_business_id_unique uniqu
 
 alter table budget_lines enable row level security;
 revoke all on budget_lines from anon, public;
+grant select, insert, update, delete on budget_lines to authenticated;
 
 -- Always readable (including once active/superseded, for audit/history). Mutation is
 -- restricted to the owner's own DRAFT sets only — once a set has been confirmed active, its
@@ -469,6 +536,58 @@ create trigger budget_lines_set_updated_at
   before update on budget_lines
   for each row execute function set_updated_at();
 
+-- Closes the budget-year bypass: without this, a populated line could be moved from a 2026
+-- draft to a 2027 draft, leaving its existing 2026-dated months untouched — activation would
+-- count 12 rows and accept it without checking they're actually 2027 rows. budget_set_id is
+-- now immutable once set; moving a line's data to a different budget year means deleting and
+-- recreating it, which naturally re-validates every month against the new parent on insert.
+create or replace function reject_budget_line_reparent() returns trigger
+language plpgsql
+as $$
+begin
+  if new.budget_set_id is distinct from old.budget_set_id then
+    raise exception 'budget_lines.budget_set_id cannot be changed once set — a line permanently belongs to the budget_set it was created under. Delete and recreate it under the new set instead.'
+      using errcode = 'integrity_constraint_violation';
+  end if;
+  return new;
+end;
+$$;
+
+create trigger budget_lines_reject_reparent
+  before update on budget_lines
+  for each row execute function reject_budget_line_reparent();
+
+-- Locking protocol for the activation race (see activate_budget_set() above): every write to
+-- budget_lines first locks its parent budget_sets row (`for update`). activate_budget_set()
+-- takes and holds that same lock for its entire transaction, so any concurrent insert, update
+-- or delete here blocks until activation finishes, then re-evaluates against the (possibly
+-- now-changed) status via the existing draft-only RLS policies. On UPDATE, both the old and
+-- new parent are locked in case a future change ever allows reparenting again — currently
+-- moot given the immutability trigger above, but correct either way.
+create or replace function lock_budget_set_for_line_write() returns trigger
+language plpgsql
+as $$
+begin
+  if tg_op = 'DELETE' then
+    perform 1 from budget_sets where id = old.budget_set_id for update;
+    return old;
+  elsif tg_op = 'UPDATE' then
+    perform 1 from budget_sets where id = old.budget_set_id for update;
+    if new.budget_set_id is distinct from old.budget_set_id then
+      perform 1 from budget_sets where id = new.budget_set_id for update;
+    end if;
+    return new;
+  else
+    perform 1 from budget_sets where id = new.budget_set_id for update;
+    return new;
+  end if;
+end;
+$$;
+
+create trigger budget_lines_lock_parent
+  before insert or update or delete on budget_lines
+  for each row execute function lock_budget_set_for_line_write();
+
 -- ---------------------------------------------------------------------------
 -- budget_line_months — REQ-017. A row's mere existence is the "explicit amount" signal
 -- (RULE-017: a blank monthly cell is missing data, never silently stored as £0).
@@ -492,6 +611,7 @@ alter table budget_line_months add constraint budget_line_months_budget_line_id_
 
 alter table budget_line_months enable row level security;
 revoke all on budget_line_months from anon, public;
+grant select, insert, update, delete on budget_line_months to authenticated;
 
 create policy "budget_line_months_select_own" on budget_line_months
   for select
@@ -575,3 +695,27 @@ $$;
 create trigger budget_line_months_check_year
   before insert or update on budget_line_months
   for each row execute function check_budget_line_month_year();
+
+-- Same locking protocol as budget_lines_lock_parent, one level down: resolves this row's
+-- budget_set via its budget_line, then locks that budget_sets row before allowing the write —
+-- so a concurrent month insert/update/delete blocks against an in-flight activation exactly
+-- like a direct budget_lines write does.
+create or replace function lock_budget_set_for_month_write() returns trigger
+language plpgsql
+as $$
+declare
+  v_line_id uuid;
+  v_budget_set_id uuid;
+begin
+  v_line_id := coalesce(new.budget_line_id, old.budget_line_id);
+  select budget_set_id into v_budget_set_id from budget_lines where id = v_line_id;
+  if v_budget_set_id is not null then
+    perform 1 from budget_sets where id = v_budget_set_id for update;
+  end if;
+  return coalesce(new, old);
+end;
+$$;
+
+create trigger budget_line_months_lock_parent
+  before insert or update or delete on budget_line_months
+  for each row execute function lock_budget_set_for_month_write();

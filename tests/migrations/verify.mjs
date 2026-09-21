@@ -176,21 +176,24 @@ async function main() {
   // change status.
   // ==========================================================================
   {
-    await asUser(userA, async () => {
-      const blockedFlip = await db.query("update budget_sets set status = 'draft' where id = $1", [draft2]);
-      report(
-        "budget_sets: owner's direct UPDATE (flip active back to draft) is denied by RLS, affects 0 rows",
-        Array.isArray(blockedFlip.rows) ? blockedFlip.rows.length === 0 : blockedFlip.affectedRows === 0
-      );
-    });
+    // Denied at the grant level now (UPDATE/DELETE explicitly revoked from authenticated on
+    // budget_sets), not just filtered by RLS — a stronger, "permission denied" failure rather
+    // than a silent 0-rows-affected no-op.
+    await asUser(userA, () =>
+      expectError(
+        "budget_sets: owner's direct UPDATE (flip active back to draft) is denied at the grant level",
+        () => db.query("update budget_sets set status = 'draft' where id = $1", [draft2]),
+        "permission denied"
+      )
+    );
 
-    await asUser(userA, async () => {
-      const blockedDelete = await db.query("delete from budget_sets where id = $1", [draft2]);
-      report(
-        "budget_sets: owner's direct DELETE of the active set is denied by RLS, affects 0 rows",
-        Array.isArray(blockedDelete.rows) ? blockedDelete.rows.length === 0 : blockedDelete.affectedRows === 0
-      );
-    });
+    await asUser(userA, () =>
+      expectError(
+        "budget_sets: owner's direct DELETE of the active set is denied at the grant level",
+        () => db.query("delete from budget_sets where id = $1", [draft2]),
+        "permission denied"
+      )
+    );
 
     const stillActiveAfterAttempts = await db.query("select status from budget_sets where id = $1", [draft2]);
     report(
@@ -297,6 +300,50 @@ async function main() {
     report(
       "activate_budget_set: the rejected draft remains a draft, untouched",
       draftStillDraft.rows[0]?.status === "draft"
+    );
+  }
+
+  // ==========================================================================
+  // Fix 4: budget_lines.budget_set_id is immutable — closes the "move a populated line to a
+  // different-year draft to bypass month/year validation" bypass. Also proves activation's
+  // own coverage check now verifies actual year, not just a count of 12 rows, as a second
+  // layer of defense.
+  // ==========================================================================
+  {
+    const draftYearA = (
+      await db.query("insert into budget_sets (business_id, year, status) values ($1, 2050, 'draft') returning id", [bizA])
+    ).rows[0].id;
+    const draftYearB = (
+      await db.query("insert into budget_sets (business_id, year, status) values ($1, 2051, 'draft') returning id", [bizA])
+    ).rows[0].id;
+    const lineToMove = (
+      await db.query(
+        `insert into budget_lines (budget_set_id, business_id, line_type, customer_name) values ($1, $2, 'customer', 'Movable Ltd') returning id`,
+        [draftYearA, bizA]
+      )
+    ).rows[0].id;
+    await insertAllMonths(db, lineToMove, bizA, 2050, 100);
+
+    await expectError(
+      "budget_lines: budget_set_id cannot be changed once set (blocks moving a populated line into a different-year draft)",
+      () => db.query("update budget_lines set budget_set_id = $1 where id = $2", [draftYearB, lineToMove]),
+      "cannot be changed"
+    );
+
+    const lineUnmoved = await db.query("select budget_set_id from budget_lines where id = $1", [lineToMove]);
+    report(
+      "budget_lines: the rejected move leaves the line under its original budget_set",
+      lineUnmoved.rows[0]?.budget_set_id === draftYearA
+    );
+
+    // draftYearB has zero lines — activation must still reject it as empty, proving the
+    // rejected reparent attempt didn't leave it looking populated.
+    await actingAs(userA, () =>
+      expectError(
+        "activate_budget_set: draftYearB is correctly still empty after the rejected reparent attempt",
+        () => db.query("select * from activate_budget_set($1)", [draftYearB]),
+        "no budget lines"
+      )
     );
   }
 
@@ -687,18 +734,55 @@ async function main() {
       "foreign key"
     );
 
-    // A later, more-complete upload with a later declared cutoff.
-    const pnlUpload2 = await db.query(
-      `insert into uploads (business_id, kind, storage_path, declares_replacement_from, declares_replacement_through)
-       values ($1, 'pnl', 'march-full.csv', '2026-03-01', '2026-03-31') returning id`,
-      [bizA]
-    );
-    report("Uploads: a second, later pnl upload inserts fine", pnlUpload2.rows.length === 1);
+    // Fix 3, corrected per Dan's review: invoiced_as_of() is NOT max(declares_replacement_through)
+    // across history — an upload with a WIDER-looking cutoff can be stale once a later,
+    // narrower correction has superseded part of its range. Build exactly that scenario in a
+    // fresh business: a wide upload (Jan 1 – Mar 31) followed by a genuine correction that
+    // narrows March to the 15th, each with its own real pnl_lines row (proving "applied", not
+    // just declared), with explicit uploaded_at timestamps so ordering is deterministic.
+    const userD = "66666666-6666-6666-6666-666666666666";
+    await db.query("insert into auth.users (id) values ($1)", [userD]);
+    const bizD = (
+      await db.query("insert into businesses (owner_user_id, name) values ($1, 'Business D') returning id", [userD])
+    ).rows[0].id;
 
-    const invoicedAsOf = await db.query("select invoiced_as_of($1) as cutoff", [bizA]);
+    const wideUpload = await db.query(
+      `insert into uploads (business_id, kind, storage_path, declares_replacement_from, declares_replacement_through, uploaded_at)
+       values ($1, 'pnl', 'q1-wide.csv', '2026-01-01', '2026-03-31', '2026-04-01 09:00:00+00') returning id`,
+      [bizD]
+    );
+    await db.query(
+      "insert into pnl_lines (business_id, period, invoiced_revenue, line_type, upload_id) values ($1, '2026-01-01', 10000, 'detail', $2)",
+      [bizD, wideUpload.rows[0].id]
+    );
+
+    const correctionUpload = await db.query(
+      `insert into uploads (business_id, kind, storage_path, declares_replacement_from, declares_replacement_through, uploaded_at)
+       values ($1, 'pnl', 'march-correction.csv', '2026-03-01', '2026-03-15', '2026-04-02 09:00:00+00') returning id`,
+      [bizD]
+    );
+    await db.query(
+      "insert into pnl_lines (business_id, period, invoiced_revenue, line_type, upload_id) values ($1, '2026-03-01', 4000, 'detail', $2)",
+      [bizD, correctionUpload.rows[0].id]
+    );
+
+    const invoicedAsOfAfterCorrection = await db.query("select invoiced_as_of($1) as cutoff", [bizD]);
     report(
-      "invoiced_as_of(): derives the MAX declared cutoff across pnl uploads, not a write timestamp",
-      invoicedAsOf.rows[0].cutoff?.toISOString().slice(0, 10) === "2026-03-31"
+      "invoiced_as_of(): a later, narrower correction (Mar 15) overrides an earlier wider upload's cutoff (Mar 31), not the other way round",
+      invoicedAsOfAfterCorrection.rows[0].cutoff?.toISOString().slice(0, 10) === "2026-03-15"
+    );
+
+    // An upload record that exists but was never successfully applied (no pnl_lines row
+    // references it) must not be trusted even if it's the most recent by timestamp.
+    await db.query(
+      `insert into uploads (business_id, kind, storage_path, declares_replacement_from, declares_replacement_through, uploaded_at)
+       values ($1, 'pnl', 'never-applied.csv', '2026-04-01', '2026-04-30', '2026-04-03 09:00:00+00')`,
+      [bizD]
+    );
+    const invoicedAsOfIgnoresUnapplied = await db.query("select invoiced_as_of($1) as cutoff", [bizD]);
+    report(
+      "invoiced_as_of(): an upload record with no pnl_lines rows (never successfully applied) is ignored, even though it's the most recent",
+      invoicedAsOfIgnoresUnapplied.rows[0].cutoff?.toISOString().slice(0, 10) === "2026-03-15"
     );
 
     const invoicedAsOfNoUploads = await db.query("select invoiced_as_of($1) as cutoff", [bizB]);
@@ -868,6 +952,43 @@ async function main() {
     report(
       "orders: anon is denied at the grant level, not just RLS",
       !!anonAttempt.error && /permission denied/i.test(String(anonAttempt.error.message))
+    );
+  }
+
+  // ==========================================================================
+  // Operational fix: grants are explicit in the migration itself, not assumed from platform
+  // defaults — this is what would have made the branch's missing-grants issue a non-issue
+  // regardless of environment.
+  // ==========================================================================
+  {
+    const expectedFullCrud = ["orders", "order_allocations", "budget_lines", "budget_line_months"];
+    for (const table of expectedFullCrud) {
+      const grants = await db.query(
+        "select privilege_type from information_schema.role_table_grants where table_schema='public' and table_name=$1 and grantee='authenticated'",
+        [table]
+      );
+      const privs = new Set(grants.rows.map((r) => r.privilege_type));
+      report(
+        `Grants: ${table} explicitly grants SELECT/INSERT/UPDATE/DELETE to authenticated`,
+        ["SELECT", "INSERT", "UPDATE", "DELETE"].every((p) => privs.has(p))
+      );
+    }
+
+    const budgetSetsGrants = await db.query(
+      "select privilege_type from information_schema.role_table_grants where table_schema='public' and table_name='budget_sets' and grantee='authenticated'"
+    );
+    const budgetSetsPrivs = new Set(budgetSetsGrants.rows.map((r) => r.privilege_type));
+    report(
+      "Grants: budget_sets grants exactly SELECT+INSERT to authenticated — no UPDATE/DELETE grant at all, matching what RLS actually allows",
+      budgetSetsPrivs.has("SELECT") && budgetSetsPrivs.has("INSERT") && !budgetSetsPrivs.has("UPDATE") && !budgetSetsPrivs.has("DELETE")
+    );
+
+    const publicCreateGrant = await db.query(
+      "select has_schema_privilege('public', 'public', 'CREATE') as can_create"
+    );
+    report(
+      "Hardening: PUBLIC cannot CREATE objects in the public schema (search_path shadowing defense)",
+      publicCreateGrant.rows[0].can_create === false
     );
   }
 
